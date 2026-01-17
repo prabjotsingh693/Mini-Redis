@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[tokio::main]
-
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
@@ -23,6 +22,52 @@ async fn main() {
     }
 }
 
+enum Command {
+    SET { key: String, value: String},
+    GET { key: String},
+    Invalid { message: String}
+}
+
+impl Command {
+    fn from_input(input: &str) -> Command{
+        let mut parts = input.trim().split_whitespace();
+        
+        let command_word = match parts.next() {
+            Some(w) => w,
+            None => return Command::Invalid { message: "Empty command".to_string() },
+        };
+
+        let key = match parts.next() {
+            Some(w) => w,
+            None => return Command::Invalid { message: "Key expected".to_string() },
+        };
+
+        match command_word {
+            "SET" => {
+                let value = parts.collect::<Vec<&str>>().join(" ");
+                
+                if value.is_empty() {
+                    return Command::Invalid { message: "Value expected".to_string() }
+                }
+
+                Command::SET { 
+                    key: key.to_string(), 
+                    value 
+                }
+            }
+
+            "GET" => Command::GET { 
+                key: key.to_string() 
+            },
+            _ => Command::Invalid { 
+                message: "Unknown Command".to_string() 
+            },
+        }
+
+
+    }
+}
+
 async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String, String>>>) {
     let mut buf = [0; 1024];
 
@@ -34,11 +79,11 @@ async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String
 
     let input = String::from_utf8_lossy(&buf[0..bytes_read]);
 
-    let parts: Vec<&str> = input.trim().split_whitespace().collect();
+    let command = Command::from_input(&input);
 
-    match parts.as_slice(){
+    match command{
 
-        ["SET", key,value] => {
+        Command::SET { key, value } => {
             {
                 let mut map = db.lock().unwrap();
                 map.insert(key.to_string(), value.to_string());
@@ -46,10 +91,10 @@ async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String
 
             socket.write_all(b"+OK\r\n").await.unwrap()
         }
-        ["GET", key] => {
+        Command::GET { key }=> {
             let response = {
                 let map = db.lock().unwrap();
-                match map.get(*key){
+                match map.get(&key){
                     Some(value) => Some(format!("${}\r\n{}\r\n", value.len(), value)),
                     None => None,
                 }    
@@ -60,7 +105,7 @@ async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String
                 None => socket.write_all(b"$-1\r\n").await.unwrap(),
             }
         }
-        _ => {
+        Command::Invalid { message }=> {
             socket.write_all(b"-ERROR Unknown Command\r\n").await.unwrap();
         }
     }
