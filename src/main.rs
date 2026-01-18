@@ -3,7 +3,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
-
+use tokio::fs::OpenOptions;
+use tokio::fs::File;
+use tokio::sync::mpsc;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 const NUM_SHARDS: usize = 16;
 
@@ -78,6 +81,47 @@ impl Command {
     }
 }
 
+async fn start_logger(mut receiver: mpsc::Receiver<String>){
+    let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("dump.aof")
+            .await
+            .unwrap();
+
+    while let Some(log) = receiver.recv().await {
+        let _ = file.write_all(log.as_bytes()).await;
+        let _ = file.write_all(b"\n").await;
+    }
+}
+
+async fn load_data(db: Arc<ShardDB>) {
+    let file = match File::open("dump.aof").await {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    println!("Loading data from the disk");
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let cmd = Command::from_input(&line);
+
+        match cmd {
+            Command:: SET {key, value} => {
+                let mut shard = db.get_shard(&key).lock().unwrap();
+                shard.insert(key, value);
+            }
+            _=> {
+
+            }
+        }
+
+
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -87,19 +131,27 @@ async fn main() {
 
     let db = Arc::new(ShardDB::new());
 
+    load_data(db.clone()).await;
+    
+    let (tx, rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        start_logger(rx).await;
+    });
 
     loop{
         let (socket, _) = listener.accept().await.unwrap();
 
         let db_handle = db.clone();
 
+        let tx_handler = tx.clone();
+
         tokio::spawn(async move {
-            process(socket, db_handle).await;
+            process(socket, db_handle, tx_handler).await;
         });
     }
 }
 
-async fn process(mut socket: tokio::net::TcpStream, db: Arc<ShardDB>) {
+async fn process(mut socket: tokio::net::TcpStream, db: Arc<ShardDB>, tx: mpsc::Sender<String>) {
     let mut buf = [0; 1024];
 
     let bytes_read = match socket.read(&mut buf).await {
@@ -119,6 +171,9 @@ async fn process(mut socket: tokio::net::TcpStream, db: Arc<ShardDB>) {
                 let mut map = db.get_shard(&key).lock().unwrap();
                 map.insert(key.to_string(), value.to_string());
             }
+
+            let entry = format!("SET {} {}", key, value);
+            tx.send(entry).await.unwrap();
 
             socket.write_all(b"+OK\r\n").await.unwrap()
         }
