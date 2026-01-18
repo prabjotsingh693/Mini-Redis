@@ -1,24 +1,34 @@
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-#[tokio::main]
-async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
-    println!("listening on 127.0.0.1:6379");
+const NUM_SHARDS: usize = 16;
 
-    let db = Arc::new(Mutex::new(HashMap::new()));
+struct ShardDB {
+    shards: Vec<Mutex<HashMap<String, String>>>
+}
 
-    loop{
-        let (socket, _) = listener.accept().await.unwrap();
+impl ShardDB {
+    fn new() -> ShardDB {
+        let mut shards = Vec::with_capacity(NUM_SHARDS);
 
-        let db_handle = db.clone();
+        for _ in 0..NUM_SHARDS{
+            shards.push(Mutex::new(HashMap::new()));
+        }
+        ShardDB { shards }
+    }
 
-        tokio::spawn(async move {
-            process(socket, db_handle).await;
-        });
+    fn get_shard(&self, key: &str) -> &Mutex<HashMap<String,String>>{
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let indx = (hash as usize) % NUM_SHARDS;
+
+        &self.shards[indx]
     }
 }
 
@@ -68,7 +78,28 @@ impl Command {
     }
 }
 
-async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String, String>>>) {
+
+#[tokio::main]
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+
+    println!("listening on 127.0.0.1:6379");
+
+    let db = Arc::new(ShardDB::new());
+
+
+    loop{
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let db_handle = db.clone();
+
+        tokio::spawn(async move {
+            process(socket, db_handle).await;
+        });
+    }
+}
+
+async fn process(mut socket: tokio::net::TcpStream, db: Arc<ShardDB>) {
     let mut buf = [0; 1024];
 
     let bytes_read = match socket.read(&mut buf).await {
@@ -85,7 +116,7 @@ async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String
 
         Command::SET { key, value } => {
             {
-                let mut map = db.lock().unwrap();
+                let mut map = db.get_shard(&key).lock().unwrap();
                 map.insert(key.to_string(), value.to_string());
             }
 
@@ -93,7 +124,7 @@ async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String
         }
         Command::GET { key }=> {
             let response = {
-                let map = db.lock().unwrap();
+                let map = db.get_shard(&key).lock().unwrap();
                 match map.get(&key){
                     Some(value) => Some(format!("${}\r\n{}\r\n", value.len(), value)),
                     None => None,
@@ -106,7 +137,8 @@ async fn process(mut socket: tokio::net::TcpStream, db: Arc<Mutex<HashMap<String
             }
         }
         Command::Invalid { message }=> {
-            socket.write_all(b"-ERROR Unknown Command\r\n").await.unwrap();
+            let err = format!("-ERROR {}\r\n", message);    
+            socket.write_all(err.as_bytes()).await.unwrap();
         }
     }
     
